@@ -1,0 +1,73 @@
+{
+  "evidence": [
+    {
+      "call_id": "call_00_XUFWUcvj2YuKi0TW2doV1786",
+      "currency": null,
+      "currency_conversion": null,
+      "field": "bytes_written",
+      "source": "write_file",
+      "status": "observed",
+      "symbol": null,
+      "timestamp": null,
+      "tool": "write_file",
+      "value": 27324,
+      "venue": null
+    }
+  ],
+  "identity": {
+    "authorized_symbols": [],
+    "records": [],
+    "status": "not_required"
+  },
+  "schema_version": 1,
+  "session_symbol_roots": [],
+  "session_symbols": [
+    "BTC-USDT",
+    "NBTC-USDT",
+    "SWAP/BTC"
+  ],
+  "tool_failures": [
+    {
+      "call_id": "call_00_0tYSpZXprgPwoosR5LwY5703",
+      "error_code": null,
+      "message": "File not found or path escapes workspace: artifacts/metrics.csv",
+      "recorded_at": "2026-08-11T16:59:11.896727Z",
+      "status": "unavailable",
+      "tool": "read_file"
+    },
+    {
+      "call_id": "call_01_9jEyFmnmXMyzinOradJG3247",
+      "error_code": null,
+      "message": "File not found or path escapes workspace: config.json",
+      "recorded_at": "2026-08-11T16:59:11.901305Z",
+      "status": "unavailable",
+      "tool": "read_file"
+    },
+    {
+      "call_id": "call_00_tdvM4nFo3Nq5QHuU6CBl1875",
+      "error_code": null,
+      "message": "File not found or path escapes workspace: /home/vibe/.vibe-trading/runs/20260811_165904_26_9f5149/config.json",
+      "recorded_at": "2026-08-11T16:59:14.266227Z",
+      "status": "unavailable",
+      "tool": "read_file"
+    },
+    {
+      "call_id": "call_00_qNFSnMnT6fKlYqf5nJwV1419",
+      "error_code": null,
+      "message": "[Errno 21] Is a directory: '<redacted>/.vibe-trading/runs/20260811_165904_26_9f5149'",
+      "recorded_at": "2026-08-11T16:59:16.145487Z",
+      "status": "unavailable",
+      "tool": "read_file"
+    }
+  ],
+  "updated_at": "2026-08-11T17:01:02.768707Z",
+  "validations": [
+    {
+      "attempt": 1,
+      "checked_at": "2026-08-11T17:01:02.768621Z",
+      "content_sha256": "17087c887f7b39df493677d716b403e93edd797e34a4639ae15fcccd4b2c1c87",
+      "issues": [],
+      "valid": true
+    }
+  ]
+}
