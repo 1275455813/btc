@@ -52,7 +52,7 @@ CONFIG = {
     "symbol":      "BTC-USDT-SWAP",
 
     # ── 仓位与风控 ──
-    "order_size":  0.01,            # 每单合约张数 (1张 = 0.01 BTC,  100张 = 1 BTC)
+    "order_size":  0.05,            # 每单合约张数 (1张 = 0.01 BTC,  100张 = 1 BTC)
     "max_position": 0.1,           # 最大持仓张数 (同向)
 
     # ── 策略参数 (与回测一致) ──
