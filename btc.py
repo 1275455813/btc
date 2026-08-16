@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -38,40 +39,40 @@ except ImportError:
     sys.exit(1)
 
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║                    ★ 配置区 — 请填写你的密钥 ★                      ║
+# ║                    ★ 配置区 — 参数全部放在 config.json ★            ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 
-CONFIG = {
-    # ── OKX API 密钥 (在 https://www.okx.com/account/my-api 创建) ──
-    "api_key":     "230a0e34-a550-4e50-ad66-4d19b55630c6",           # ← 填写你的 API Key
-    "api_secret":  "3316946829E8A838C5E103A770EC1F96",           # ← 填写你的 Secret Key
-    "passphrase":  "577320179aA.",           # ← 填写你的 Passphrase
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
-    # ── 交易模式 ──
-    "demo":        False,         # True=模拟盘(需要 demo API key), False=实盘
-    "symbol":      "BTC-USDT-SWAP",
+# 配置字段说明 (与 config.json 一一对应):
+#   api_key / api_secret / passphrase : OKX API 密钥
+#   proxy                            : 代理地址, 如 "http://127.0.0.1:7890", 留空 "" 表示不使用代理
+#   demo                             : True=模拟盘, False=实盘
+#   symbol                           : 交易品种
+#   order_size / max_position        : 每单张数 / 最大持仓张数
+#   rsi_period / entry_long / entry_short / exit_long / exit_short / trailing_pct : 策略参数
+#   limit_offset_bps / order_timeout / max_retry : 挂单参数
+#   poll_interval / candle_limit / max_fetch_errors : 运行参数
 
-    # ── 仓位与风控 ──
-    "order_size":  0.05,            # 每单合约张数 (1张 = 0.01 BTC,  100张 = 1 BTC)
-    "max_position": 0.1,           # 最大持仓张数 (同向)
 
-    # ── 策略参数 (与回测一致) ──
-    "rsi_period":  14,           # RSI 周期
-    "entry_long":  30,           # 做多入场阈值 (RSI 上穿此值)
-    "entry_short": 70,           # 做空入场阈值 (RSI 下穿此值)
-    "exit_long":   65,           # 多头 RSI 出场阈值
-    "exit_short":  35,           # 空头 RSI 出场阈值
-    "trailing_pct": 0.02,        # 移动止损 2.0%
+def load_config(path: str = CONFIG_PATH) -> dict:
+    """从 JSON 文件加载配置; 文件不存在或格式错误时给出明确提示并退出。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        print(f"错误: 找不到配置文件 {path}, 请从 config.json 创建并填写参数。")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"错误: 配置文件 {path} 不是合法的 JSON: {e}")
+        sys.exit(1)
+    if not isinstance(cfg, dict):
+        print("错误: 配置文件格式错误, 顶层必须是 JSON 对象。")
+        sys.exit(1)
+    return cfg
 
-    # ── 挂单参数 ──
-    "limit_offset_bps": 1.0,     # 限价单偏移 (bps, 1.0 = 万分之一, 挂在我们有利的方向)
-    "order_timeout":   120,      # 挂单超时秒数, 超时未成交自动撤单重挂
-    "max_retry":       5,        # 同方向最大重挂次数, 超过则放弃本信号
 
-    # ── 运行 ──
-    "poll_interval": 15,         # 轮询间隔 (秒)
-    "candle_limit":  200,        # 初始加载 K 线条数
-}
+CONFIG = load_config()
 
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║                         策略核心引擎                                 ║
@@ -222,14 +223,19 @@ class OKXTradingBot:
 
         # 初始化 OKX API 客户端
         flag = "1" if self.demo else "0"  # 1=模拟盘, 0=实盘
+        proxy = cfg.get("proxy") or None  # 未配置或为空时禁用代理
         self._account_api    = AccountAPI.AccountAPI(
-            cfg["api_key"], cfg["api_secret"], cfg["passphrase"], False, flag)
+            cfg["api_key"], cfg["api_secret"], cfg["passphrase"], False, flag,
+            proxy=proxy)
         self._trade_api      = TradeAPI.TradeAPI(
-            cfg["api_key"], cfg["api_secret"], cfg["passphrase"], False, flag)
+            cfg["api_key"], cfg["api_secret"], cfg["passphrase"], False, flag,
+            proxy=proxy)
         self._market_api     = MarketDataAPI.MarketAPI(
-            cfg["api_key"], cfg["api_secret"], cfg["passphrase"], False, flag)
+            cfg["api_key"], cfg["api_secret"], cfg["passphrase"], False, flag,
+            proxy=proxy)
         self._public_api     = PublicDataAPI.PublicAPI(
-            cfg["api_key"], cfg["api_secret"], cfg["passphrase"], False, flag)
+            cfg["api_key"], cfg["api_secret"], cfg["passphrase"], False, flag,
+            proxy=proxy)
 
         self.symbol    = cfg["symbol"]
         self.order_sz  = str(cfg["order_size"])
@@ -251,6 +257,9 @@ class OKXTradingBot:
         # 运行控制
         self._running = False
         self._closes: List[float] = []
+
+        # 连续获取K线异常计数
+        self._fetch_error_count = 0
 
     # ── 初始化: 获取合约信息 + 加载历史K线 ────────────────────────
     async def initialize(self):
@@ -283,15 +292,25 @@ class OKXTradingBot:
                 limit=str(self.cfg["candle_limit"]))
             if resp.get("code") != "0":
                 log.warning(f"获取K线失败: {resp}")
+                # 业务失败同样计入连续异常, 但此处不抛异常, 返回后由调用方继续
                 return
             # OKX 返回顺序: [ts, o, h, l, c, vol, ...] 最新在前
             candles = resp["data"]
             closes = [float(c[4]) for c in reversed(candles)]
             self._closes = closes
             self.strategy.update(closes)
+            # 成功获取, 清零连续异常计数
+            if self._fetch_error_count:
+                log.info(f"K线获取恢复正常, 连续异常计数清零 (此前 {self._fetch_error_count} 次)")
+            self._fetch_error_count = 0
             log.info(f"K 线预热完成, {len(closes)} 根 | 最新 RSI={self.strategy.rsi:.1f}")
         except Exception as e:
-            log.error(f"获取K线异常: {e}")
+            self._fetch_error_count += 1
+            log.error(f"获取K线异常: {e}  (连续第 {self._fetch_error_count} 次)")
+            if self._fetch_error_count >= self.cfg.get("max_fetch_errors", 10):
+                log.error(f"连续 {self._fetch_error_count} 次获取K线异常, 达到阈值, "
+                          f"即将重新运行程序主体...")
+                restart_program()
 
     # ── 获取最新价格 ────────────────────────────────────────────────
     def _get_current_price(self) -> Optional[float]:
@@ -583,11 +602,11 @@ def validate_config(cfg: dict):
     """启动前校验配置"""
     errors = []
     if not cfg["api_key"]:
-        errors.append("api_key 为空 — 请在脚本顶部 CONFIG 中填写 OKX API Key")
+        errors.append("api_key 为空 — 请在 config.json 中填写 OKX API Key")
     if not cfg["api_secret"]:
-        errors.append("api_secret 为空 — 请在脚本顶部 CONFIG 中填写 OKX Secret Key")
+        errors.append("api_secret 为空 — 请在 config.json 中填写 OKX Secret Key")
     if not cfg["passphrase"]:
-        errors.append("passphrase 为空 — 请在脚本顶部 CONFIG 中填写 OKX Passphrase")
+        errors.append("passphrase 为空 — 请在 config.json 中填写 OKX Passphrase")
     if cfg["order_size"] < 0.01:
         errors.append(f"order_size ({cfg['order_size']}) < 最小下单量")
     if errors:
@@ -595,6 +614,29 @@ def validate_config(cfg: dict):
             log.error(e)
         return False
     return True
+
+
+def restart_program():
+    """
+    重新运行程序主体。
+    跨平台实现: 启动一个新进程运行本脚本, 随后立即退出当前进程。
+    Windows 下使用 CREATE_NEW_PROCESS_GROUP 避免 Ctrl+C 信号影响新进程。
+    """
+    log.info("正在重新启动程序...")
+    try:
+        cmd = [sys.executable, os.path.abspath(__file__)]
+        # 透传命令行参数 (除去脚本本身)
+        cmd.extend(sys.argv[1:])
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            creationflags = 0
+        subprocess.Popen(cmd, creationflags=creationflags)
+    except Exception as e:
+        log.error(f"重新启动程序失败: {e}")
+        return
+    # 立即退出当前进程, 由新进程接手
+    os._exit(0)
 
 
 async def main():
