@@ -224,6 +224,7 @@ class OKXTradingBot:
         # 初始化 OKX API 客户端
         flag = "1" if self.demo else "0"  # 1=模拟盘, 0=实盘
         proxy = cfg.get("proxy") or None  # 未配置或为空时禁用代理
+        timeout = cfg.get("timeout", 30)  # 请求超时(秒), 走代理时 SSL 握手较慢需放宽
         self._account_api    = AccountAPI.AccountAPI(
             cfg["api_key"], cfg["api_secret"], cfg["passphrase"], False, flag,
             proxy=proxy)
@@ -236,6 +237,12 @@ class OKXTradingBot:
         self._public_api     = PublicDataAPI.PublicAPI(
             cfg["api_key"], cfg["api_secret"], cfg["passphrase"], False, flag,
             proxy=proxy)
+
+        # SDK 未提供 timeout 入参, 而 httpx 默认仅 5 秒, 走代理时易超时;
+        # 客户端继承自 httpx.Client, 初始化后统一放宽超时。
+        for _api in (self._account_api, self._trade_api,
+                     self._market_api, self._public_api):
+            _api.timeout = timeout
 
         self.symbol    = cfg["symbol"]
         self.order_sz  = str(cfg["order_size"])
@@ -263,25 +270,32 @@ class OKXTradingBot:
 
     # ── 初始化: 获取合约信息 + 加载历史K线 ────────────────────────
     async def initialize(self):
-        """获取合约规格并预热 RSI"""
-        log.info("正在获取合约信息...")
-        try:
-            resp = self._public_api.get_instruments(
-                instType="SWAP", instId=self.symbol)
-            if resp.get("code") != "0":
-                raise RuntimeError(f"获取合约信息失败: {resp}")
-            inst = resp["data"][0]
-            self._tick_size = float(inst["tickSz"])
-            self._lot_size  = int(float(inst["lotSz"]))
-            self._min_size  = int(float(inst["minSz"]))
-            log.info(f"合约: {self.symbol}  |  tick: {self._tick_size}  |  "
-                     f"lot: {self._lot_size}  |  ctVal: {inst.get('ctVal', '?')}")
-        except Exception as e:
-            log.error(f"获取合约信息异常: {e}")
-            raise
+        """获取合约规格并预热 RSI。
 
-        # 预热 K 线
-        await self._fetch_and_update_closes()
+        网络异常时不抛出异常退出进程, 而是每 30 秒重新初始化一次,
+        等待网络恢复后自动继续运行。
+        注意: K线连续失败重启逻辑在 _fetch_and_update_closes 中保持不变。
+        """
+        while True:
+            try:
+                log.info("正在获取合约信息...")
+                resp = self._public_api.get_instruments(
+                    instType="SWAP", instId=self.symbol)
+                if resp.get("code") != "0":
+                    raise RuntimeError(f"获取合约信息失败: {resp}")
+                inst = resp["data"][0]
+                self._tick_size = float(inst["tickSz"])
+                self._lot_size  = int(float(inst["lotSz"]))
+                self._min_size  = int(float(inst["minSz"]))
+                log.info(f"合约: {self.symbol}  |  tick: {self._tick_size}  |  "
+                         f"lot: {self._lot_size}  |  ctVal: {inst.get('ctVal', '?')}")
+
+                # 预热 K 线
+                await self._fetch_and_update_closes()
+                return
+            except Exception as e:
+                log.error(f"初始化异常: {e}  |  30 秒后重试初始化...")
+                await asyncio.sleep(30)
 
     async def _fetch_and_update_closes(self):
         """从 REST 拉取历史 K 线并更新策略"""
