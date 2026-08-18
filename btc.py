@@ -1,31 +1,32 @@
 #!/usr/bin/env python3
 """
-BTC-USDT 永续合约 RSI(14) 均值回归策略 — 纯做市商（Post-Only）实盘机器人
+BTC-USDT 永续合约 RSI(14) 均值回归策略 — 实盘机器人
 =========================================================================
 品种:     BTC-USDT-SWAP (OKX 永续)
 K线:      15 分钟
-费率:     做市商 0.02% (post-only 限价单保证)
-下单方式: 仅挂单 (post-only limit) — 永不主动吃单
+费率:     全流程仅挂限价单 (入场 post-only, 出场限价/条件限价)
 
 策略逻辑 (回测验证: 2026-07-12 ~ 2026-08-11, 胜率 65.7%, 回报 +1.43%)
   做多: RSI(14) 从下方上穿 30
   做空: RSI(14) 从上方下穿 70
-  多头平仓: RSI(14) ≥ 65  或  从持仓最高点回落 ≥ 2.0%
-  空头平仓: RSI(14) ≤ 35  或  从持仓最低点反弹 ≥ 2.0%
 
-依赖: pip install python-okx
+出场 (预测价格提前挂单, 全部限价成交):
+  多头:
+    - RSI 止盈: RSI ≥ (exit_long - tp_arm_margin) 时, 二分反推 RSI=exit_long 的价格,
+      在该价预挂卖出限价单; 每轮询预测价漂移 ≥ replace_pct 即撤单重挂。
+    - 移动止损: 从最高点回落 ≥ sl_arm_ratio*trailing_pct 时, 预挂
+      peak*(1-trailing_pct) 的条件限价卖单; 回落 < sl_arm_ratio*trailing_pct 撤单。
+  空头: 对称 (反弹 / trough*(1+trailing_pct) 买单)。
 """
 
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import subprocess
 import sys
-import time
-from datetime import datetime, timezone, timedelta
-from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Optional, Dict, Any, List
 
 # ── OKX SDK ──────────────────────────────────────────────────────────
@@ -51,6 +52,10 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 #   symbol                           : 交易品种
 #   order_size / max_position        : 每单张数 / 最大持仓张数
 #   rsi_period / entry_long / entry_short / exit_long / exit_short / trailing_pct : 策略参数
+#   tp_arm_margin                    : 提前预挂止盈的 RSI 余量 (RSI 点), 如 5 表示距阈值 5 点内开始预挂
+#   sl_arm_ratio                     : 移动止损预挂启动比例 (占 trailing_pct 的比例), 如 0.5
+#   replace_pct                      : 预测挂单价漂移超过该比例时撤单重挂 (如 0.001 = 0.1%)
+#   sl_guard_pct                     : 止损条件单触发后的限价偏移 (确保成交), 如 0.001 = 0.1%
 #   limit_offset_bps / order_timeout / max_retry : 挂单参数
 #   poll_interval / candle_limit / max_fetch_errors : 运行参数
 
@@ -74,12 +79,13 @@ def load_config(path: str = CONFIG_PATH) -> dict:
 
 CONFIG = load_config()
 
+
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║                         策略核心引擎                                 ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 
 class RSIStrategy:
-    """RSI(14) 均值回归 — 信号生成 & 出场判断"""
+    """RSI(14) 均值回归 — 信号生成 & 出场/预挂单计算"""
 
     def __init__(self, cfg: dict):
         self.period    = cfg["rsi_period"]
@@ -89,9 +95,9 @@ class RSIStrategy:
         self.short_out = cfg["exit_short"]
         self.trail_pct = cfg["trailing_pct"]
 
-        self._gains: List[float] = []
-        self._losses: List[float] = []
-        self._prev_close: Optional[float] = None
+        self.tp_arm_margin = float(cfg.get("tp_arm_margin", 5))
+        self.sl_arm_ratio  = float(cfg.get("sl_arm_ratio", 0.5))
+
         self._rsi_history: List[float] = []       # 最近两条 RSI 用于检测交叉
         self._current_rsi: Optional[float] = None
 
@@ -128,16 +134,18 @@ class RSIStrategy:
         rs = avg_gain / avg_loss
         return 100.0 - (100.0 / (1.0 + rs))
 
+    def _rsi_at_price(self, closes: List[float], p: float) -> float:
+        """假设下一收盘价为 p 时的 RSI 值"""
+        return self._wilders_rsi(list(closes) + [float(p)])
+
     # ── 更新 K 线 ──────────────────────────────────────────────────
     def update(self, closes: List[float]):
-        """传入完整收盘价序列, 检查信号"""
+        """传入完整收盘价序列, 更新最新 RSI 并检测交叉"""
         if len(closes) < self.period + 1:
             return None
-
         rsi = self._wilders_rsi(closes)
         self._current_rsi = rsi
 
-        # 保留最近 2 个 RSI 用于交叉检测
         self._rsi_history.append(rsi)
         if len(self._rsi_history) > 2:
             self._rsi_history = self._rsi_history[-2:]
@@ -149,45 +157,81 @@ class RSIStrategy:
             return None
         prev_rsi, curr_rsi = self._rsi_history[-2], self._rsi_history[-1]
 
-        # 做多: RSI 从 ≤30 上穿到 >30
         if prev_rsi <= self.long_in and curr_rsi > self.long_in:
             return "long"
-        # 做空: RSI 从 ≥70 下穿到 <70
         if prev_rsi >= self.short_in and curr_rsi < self.short_in:
             return "short"
         return None
-        #return "long"
 
-    # ── 出场信号 ───────────────────────────────────────────────────
-    def exit_signal(self, current_price: float) -> bool:
-        """
-        返回 True = 需要平仓。
-        调用方需先检查 self.in_position。
-        """
+    # ── 止盈预挂: 是否已进入预挂区间 ──────────────────────────────
+    @property
+    def tp_armed(self) -> bool:
         if self.in_position is None or self._current_rsi is None:
             return False
+        if self.in_position == "long":
+            return self._current_rsi >= self.long_out - self.tp_arm_margin
+        return self._current_rsi <= self.short_out + self.tp_arm_margin
+
+    # ── 止盈预挂: 二分反解目标价格 ────────────────────────────────
+    def predict_exit_price(self, closes: List[float]) -> Optional[float]:
+        """
+        返回"下一根收盘价 p 使 RSI 恰等于出场阈值"的价格。
+        多头返回 exit_long 对应价 (上方), 空头返回 exit_short 对应价 (下方)。
+        """
+        if self.in_position is None or len(closes) < self.period + 1:
+            return None
+
+        target = self.long_out if self.in_position == "long" else self.short_out
+        cur = self._wilders_rsi(closes)
+        ref = closes[-1]
+
+        # 已经越过阈值 → 返回当前价, 由调用方夹取到 maker 一侧
+        if self.in_position == "long":
+            if cur >= target:
+                return ref
+            lo, hi = ref, ref * 1.20
+        else:
+            if cur <= target:
+                return ref
+            lo, hi = ref * 0.80, ref
+
+        # 扩展区间, 保证 target 落在 [RSI(lo), RSI(hi)] 内
+        for _ in range(10):
+            if self._rsi_at_price(closes, lo) <= target <= self._rsi_at_price(closes, hi):
+                break
+            if self.in_position == "long":
+                hi *= 1.3
+            else:
+                lo *= 0.7
+
+        for _ in range(120):
+            mid = (lo + hi) / 2.0
+            if self._rsi_at_price(closes, mid) < target:
+                lo = mid
+            else:
+                hi = mid
+        return (lo + hi) / 2.0
+
+    # ── 移动止损预挂信息 ──────────────────────────────────────────
+    def stop_info(self, current_price: float):
+        """返回 (armed, stop_price)。armed=True 表示接近止损, 应预挂条件单。"""
+        if self.in_position is None:
+            return False, 0.0
+
+        arm = self.sl_arm_ratio * self.trail_pct
 
         if self.in_position == "long":
-            # 条件 1: RSI ≥ 65
-            if self._current_rsi >= self.long_out:
-                return True
-            # 条件 2: 从最高点回落 ≥ 2.0%
-            if self.peak_price > 0:
-                drawdown = (self.peak_price - current_price) / self.peak_price
-                if drawdown >= self.trail_pct:
-                    return True
+            if self.peak_price <= 0:
+                return False, 0.0
+            drawdown = (self.peak_price - current_price) / self.peak_price
+            stop_price = self.peak_price * (1 - self.trail_pct)
+            return drawdown >= arm, stop_price
 
-        elif self.in_position == "short":
-            # 条件 1: RSI ≤ 35
-            if self._current_rsi <= self.short_out:
-                return True
-            # 条件 2: 从最低点反弹 ≥ 2.0%
-            if self.trough_price > 0:
-                rebound = (current_price - self.trough_price) / self.trough_price
-                if rebound >= self.trail_pct:
-                    return True
-
-        return False
+        if self.trough_price <= 0:
+            return False, 0.0
+        rebound = (current_price - self.trough_price) / self.trough_price
+        stop_price = self.trough_price * (1 + self.trail_pct)
+        return rebound >= arm, stop_price
 
     # ── 更新持仓峰值/谷值 ──────────────────────────────────────────
     def update_peak_trough(self, current_price: float):
@@ -215,31 +259,27 @@ class RSIStrategy:
 # ╚══════════════════════════════════════════════════════════════════════╝
 
 class OKXTradingBot:
-    """OKX 永续合约交易执行 — 纯 Post-Only 限价单"""
+    """OKX 永续合约交易执行 — 全部挂限价单 (入场 post-only, 出场限价/条件限价)"""
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.demo = cfg["demo"]
 
-        # 初始化 OKX API 客户端
         flag = "1" if self.demo else "0"  # 1=模拟盘, 0=实盘
-        proxy = cfg.get("proxy") or None  # 未配置或为空时禁用代理
-        timeout = cfg.get("timeout", 30)  # 请求超时(秒), 走代理时 SSL 握手较慢需放宽
-        self._account_api    = AccountAPI.AccountAPI(
+        proxy = cfg.get("proxy") or None
+        timeout = cfg.get("timeout", 30)
+        self._account_api = AccountAPI.AccountAPI(
             cfg["api_key"], cfg["api_secret"], cfg["passphrase"], False, flag,
             proxy=proxy)
-        self._trade_api      = TradeAPI.TradeAPI(
+        self._trade_api = TradeAPI.TradeAPI(
             cfg["api_key"], cfg["api_secret"], cfg["passphrase"], False, flag,
             proxy=proxy)
-        self._market_api     = MarketDataAPI.MarketAPI(
+        self._market_api = MarketDataAPI.MarketAPI(
             cfg["api_key"], cfg["api_secret"], cfg["passphrase"], False, flag,
             proxy=proxy)
-        self._public_api     = PublicDataAPI.PublicAPI(
+        self._public_api = PublicDataAPI.PublicAPI(
             cfg["api_key"], cfg["api_secret"], cfg["passphrase"], False, flag,
             proxy=proxy)
-
-        # SDK 未提供 timeout 入参, 而 httpx 默认仅 5 秒, 走代理时易超时;
-        # 客户端继承自 httpx.Client, 初始化后统一放宽超时。
         for _api in (self._account_api, self._trade_api,
                      self._market_api, self._public_api):
             _api.timeout = timeout
@@ -248,34 +288,39 @@ class OKXTradingBot:
         self.order_sz  = str(cfg["order_size"])
         self.max_pos   = cfg["max_position"]
 
-        # 策略引擎
         self.strategy = RSIStrategy(cfg)
 
-        # 订单管理
-        self._pending_order_id: Optional[str] = None
-        self._pending_side:     Optional[str] = None
-        self._retry_count:      int = 0
+        # 入场挂单追踪
+        self._entry_order_id: Optional[str] = None
+        self._entry_side:     Optional[str] = None
+        self._entry_retry:    int = 0
+
+        # 止盈挂单追踪 (普通 post-only 限价单)
+        self._tp_order_id: Optional[str] = None
+        self._tp_order_px: float = 0.0
+
+        # 移动止损条件单追踪 (OKX algo order)
+        self._sl_algo_id:  Optional[str] = None
+        self._sl_stop_px:  float = 0.0
 
         # 合约信息 (运行时填充)
-        self._tick_size:  float = 0.1
-        self._lot_size:   int   = 1
-        self._min_size:   int   = 1
+        self._tick_size: float = 0.1
 
         # 运行控制
         self._running = False
         self._closes: List[float] = []
-
-        # 连续获取K线异常计数
         self._fetch_error_count = 0
 
-    # ── 初始化: 获取合约信息 + 加载历史K线 ────────────────────────
-    async def initialize(self):
-        """获取合约规格并预热 RSI。
+    # ── 工具: 价格对齐到 tick ─────────────────────────────────────
+    def _round_tick(self, px: float) -> float:
+        tick = self._tick_size
+        if tick <= 0:
+            return px
+        decimals = max(0, -int(round(math.log10(tick))))
+        return round(round(px / tick) * tick, decimals)
 
-        网络异常时不抛出异常退出进程, 而是每 30 秒重新初始化一次,
-        等待网络恢复后自动继续运行。
-        注意: K线连续失败重启逻辑在 _fetch_and_update_closes 中保持不变。
-        """
+    # ── 初始化 ─────────────────────────────────────────────────────
+    async def initialize(self):
         while True:
             try:
                 log.info("正在获取合约信息...")
@@ -285,12 +330,8 @@ class OKXTradingBot:
                     raise RuntimeError(f"获取合约信息失败: {resp}")
                 inst = resp["data"][0]
                 self._tick_size = float(inst["tickSz"])
-                self._lot_size  = int(float(inst["lotSz"]))
-                self._min_size  = int(float(inst["minSz"]))
                 log.info(f"合约: {self.symbol}  |  tick: {self._tick_size}  |  "
-                         f"lot: {self._lot_size}  |  ctVal: {inst.get('ctVal', '?')}")
-
-                # 预热 K 线
+                         f"ctVal: {inst.get('ctVal', '?')}")
                 await self._fetch_and_update_closes()
                 return
             except Exception as e:
@@ -298,26 +339,20 @@ class OKXTradingBot:
                 await asyncio.sleep(30)
 
     async def _fetch_and_update_closes(self):
-        """从 REST 拉取历史 K 线并更新策略"""
         try:
             resp = self._market_api.get_candlesticks(
-                instId=self.symbol,
-                bar="15m",
-                limit=str(self.cfg["candle_limit"]))
+                instId=self.symbol, bar="15m", limit=str(self.cfg["candle_limit"]))
             if resp.get("code") != "0":
                 log.warning(f"获取K线失败: {resp}")
-                # 业务失败同样计入连续异常, 但此处不抛异常, 返回后由调用方继续
                 return
-            # OKX 返回顺序: [ts, o, h, l, c, vol, ...] 最新在前
             candles = resp["data"]
-            closes = [float(c[4]) for c in reversed(candles)]
+            closes = [float(c[4]) for c in reversed(candles)]  # oldest → newest
             self._closes = closes
             self.strategy.update(closes)
-            # 成功获取, 清零连续异常计数
             if self._fetch_error_count:
                 log.info(f"K线获取恢复正常, 连续异常计数清零 (此前 {self._fetch_error_count} 次)")
             self._fetch_error_count = 0
-            log.info(f"K 线预热完成, {len(closes)} 根 | 最新 RSI={self.strategy.rsi:.1f}")
+            log.info(f"K 线更新完成, {len(closes)} 根 | 最新 RSI={self.strategy.rsi:.1f}")
         except Exception as e:
             self._fetch_error_count += 1
             log.error(f"获取K线异常: {e}  (连续第 {self._fetch_error_count} 次)")
@@ -326,9 +361,8 @@ class OKXTradingBot:
                           f"即将重新运行程序主体...")
                 restart_program()
 
-    # ── 获取最新价格 ────────────────────────────────────────────────
+    # ── 行情 / 持仓 / 挂单查询 ────────────────────────────────────
     def _get_current_price(self) -> Optional[float]:
-        """获取最新成交价"""
         try:
             resp = self._market_api.get_ticker(instId=self.symbol)
             if resp.get("code") == "0" and resp["data"]:
@@ -337,18 +371,13 @@ class OKXTradingBot:
             log.error(f"获取行情异常: {e}")
         return None
 
-    # ── 查询持仓 ─────────────────────────────────────────────────────
     def _get_position(self) -> Optional[Dict[str, Any]]:
-        """返回当前 BTC-USDT-SWAP 持仓, 无持仓返回 None"""
         try:
             resp = self._account_api.get_positions(instId=self.symbol)
             if resp.get("code") != "0":
                 return None
             for pos in resp.get("data", []):
                 qty = float(pos.get("pos", 0))
-                log.info(f"debug1, {qty}")
-                dbug1 = pos["posSide"]
-                log.info(f"debug2, {dbug1}")
                 if qty != 0:
                     return {"side": "long" if qty > 0 else "short",
                             "qty": abs(qty),
@@ -358,7 +387,6 @@ class OKXTradingBot:
             log.error(f"查询持仓异常: {e}")
         return None
 
-    # ── 查询挂单 ─────────────────────────────────────────────────────
     def _get_pending_orders(self) -> List[Dict]:
         try:
             resp = self._trade_api.get_order_list(instId=self.symbol, state="live")
@@ -369,146 +397,211 @@ class OKXTradingBot:
             log.error(f"查询挂单异常: {e}")
             return []
 
-    # ── 撤单 ─────────────────────────────────────────────────────────
-    def _cancel_all_orders(self) -> bool:
-        """取消所有挂单。返回 True 表示全部取消成功; False 表示有订单取消失败。
-           仅当全部成功时才清除内部 tracking 状态, 防止取消失败后重复下单。"""
-        orders = self._get_pending_orders()
-        if not orders:
-            self._pending_order_id = None
-            self._pending_side = None
-            return True
-        all_cancelled = True
-        for o in orders:
-            try:
-                resp = self._trade_api.cancel_order(
-                    instId=self.symbol, ordId=o["ordId"])
-                if resp.get("code") == "0":
-                    log.info(f"撤单成功: ordId={o['ordId']} side={o.get('side')} sz={o.get('sz')}张")
-                else:
-                    log.warning(f"撤单业务失败 ordId={o['ordId']}, resp={resp}")
-                    all_cancelled = False
-            except Exception as e:
-                log.error(f"撤单异常 ordId={o['ordId']}: {e}")
-                all_cancelled = False
-        if all_cancelled:
-            self._pending_order_id = None
-            self._pending_side = None
-        return all_cancelled
-
-    # ── 下限价单 (Post-Only) ────────────────────────────────────────
-    def _place_limit(self, side: str, price: float) -> Optional[str]:
-        """
-        下限价单 (post-only)。
-        side: 'buy' or 'sell'
-        price: 限价
-        返回 orderId or None
-        """
-        # 规范化价格到 tick
-        tick = self._tick_size
-        px = round(round(price / tick) * tick, max(0, -int(round(__import__('math').log10(tick)))))
-        sz = str(self.order_sz)
-
+    # ── 下单 / 撤单 / 检查成交 ────────────────────────────────────
+    def _place_limit(self, side: str, price: float, sz=None,
+                     reduce_only: bool = False) -> Optional[str]:
+        """post-only 限价单。sz 缺省用 order_size。"""
+        px = self._round_tick(price)
+        sz_s = str(sz) if sz is not None else self.order_sz
+        ro = "true" if reduce_only else ""
         try:
             resp = self._trade_api.place_order(
                 instId=self.symbol,
-                tdMode="cross",           # 全仓
+                tdMode="cross",
                 side=side,
-                ordType="post_only",      # ← 关键: 纯做市商
-                sz=sz,
-                px=str(px))
+                ordType="post_only",
+                sz=sz_s,
+                px=str(px),
+                reduceOnly=ro)
             if resp.get("code") == "0":
                 ord_id = resp["data"][0]["ordId"]
-                log.info(f"挂单: {side.upper()} {sz}张 @ {px}  (post-only)  id={ord_id}")
+                log.info(f"挂限价单: {side.upper()} {sz_s}张 @ {px} id={ord_id}")
                 return ord_id
-            else:
-                log.error(f"下单失败: {resp}")
-                return None
+            log.error(f"挂限价单失败: {resp}")
+            return None
         except Exception as e:
-            log.error(f"下单异常: {e}")
+            log.error(f"挂限价单异常: {e}")
             return None
 
-    # ── 市价平仓 (紧急情况也允许 taker) ────────────────────────────
-    def _close_position(self, side: str):
-        """平掉当前持仓 (使用限价单以保持 maker 费率)"""
-        price = self._get_current_price()
-        if price is None:
-            log.error("无法获取价格, 平仓失败")
+    def _place_stop_algo(self, side: str, trigger_px: float, order_px: float,
+                         qty: float) -> Optional[str]:
+        """移动止损条件单: 价格触及 trigger_px 时挂出 order_px 的限价单 (reduceOnly)。"""
+        try:
+            resp = self._trade_api.place_algo_order(
+                instId=self.symbol,
+                tdMode="cross",
+                side=side,
+                ordType="conditional",
+                sz=str(qty),
+                reduceOnly="true",
+                triggerPx=str(trigger_px),
+                orderPx=str(order_px))
+            if resp.get("code") == "0":
+                algo_id = resp["data"][0]["algoId"]
+                log.info(f"挂止损条件单: {side.upper()} {qty}张 trigger={trigger_px} "
+                         f"order={order_px} algoId={algo_id}")
+                return algo_id
+            log.error(f"挂止损条件单失败: {resp}")
+            return None
+        except Exception as e:
+            log.error(f"挂止损条件单异常: {e}")
+            return None
+
+    def _cancel_order_id(self, ord_id: str) -> bool:
+        try:
+            resp = self._trade_api.cancel_order(instId=self.symbol, ordId=ord_id)
+            ok = resp.get("code") == "0"
+            if ok:
+                log.info(f"撤单成功: ordId={ord_id}")
+            else:
+                log.warning(f"撤单失败 ordId={ord_id}, resp={resp}")
+            return ok
+        except Exception as e:
+            log.error(f"撤单异常 ordId={ord_id}: {e}")
             return False
 
-        # 平仓方向: long 持仓 → sell 平仓; short 持仓 → buy 平仓
-        close_side = "sell" if side == "long" else "buy"
-        # Post-only 平仓: 挂对己方有利的价格
-        offset = price * self.cfg["limit_offset_bps"] / 10000.0
-        if close_side == "sell":
-            px = price + offset  # 卖单挂高一点
-        else:
-            px = price - offset  # 买单挂低一点
+    def _cancel_algo_id(self, algo_id: str) -> bool:
+        try:
+            resp = self._trade_api.cancel_algo_order(
+                [{"instId": self.symbol, "algoId": algo_id}])
+            ok = resp.get("code") == "0"
+            if ok:
+                log.info(f"撤条件单成功: algoId={algo_id}")
+            else:
+                log.warning(f"撤条件单失败 algoId={algo_id}, resp={resp}")
+            return ok
+        except Exception as e:
+            log.error(f"撤条件单异常 algoId={algo_id}: {e}")
+            return False
 
-        ord_id = self._place_limit(close_side, px)
-        if ord_id:
-            self._pending_order_id = ord_id
-            self._pending_side = close_side
-            self._retry_count = 0
-            return True
-        return False
-
-    # ── 入场下单 ─────────────────────────────────────────────────────
-    def _place_entry(self, direction: str):
-        """direction: 'long' 或 'short'"""
-        price = self._get_current_price()
-        if price is None:
-            log.error("无法获取价格, 跳过入场")
-            return
-
-        # 偏移量让我们成为 maker
-        offset = price * self.cfg["limit_offset_bps"] / 10000.0
-
-        if direction == "long":
-            px = price - offset  # 买入价低于当前价 → maker
-        else:
-            px = price + offset  # 卖出价高于当前价 → maker
-
-        ord_id = self._place_limit("buy" if direction == "long" else "sell", px)
-        if ord_id:
-            self._pending_order_id = ord_id
-            self._pending_side = direction
-            self._retry_count = 0
-
-    # ── 检查挂单是否成交 ────────────────────────────────────────────
     def _check_order_filled(self, ord_id: str) -> bool:
         try:
             resp = self._trade_api.get_order(instId=self.symbol, ordId=ord_id)
             if resp.get("code") != "0":
                 return False
-            state = resp["data"][0]["state"]
-            return state == "filled"
+            return resp["data"][0]["state"] == "filled"
         except Exception:
             return False
 
+    # ── 入场下单 ─────────────────────────────────────────────────────
+    def _place_entry(self, direction: str):
+        price = self._get_current_price()
+        if price is None:
+            log.error("无法获取价格, 跳过入场")
+            return
+
+        offset = price * self.cfg["limit_offset_bps"] / 10000.0
+        if direction == "long":
+            px = price - offset
+            side = "buy"
+        else:
+            px = price + offset
+            side = "sell"
+
+        ord_id = self._place_limit(side, px)
+        if ord_id:
+            self._entry_order_id = ord_id
+            self._entry_side = direction
+            self._entry_retry = 0
+
+    # ── 止盈挂单 ─────────────────────────────────────────────────────
+    def _place_tp(self, side: str, px: float, qty: float):
+        close_side = "sell" if side == "long" else "buy"
+        ord_id = self._place_limit(close_side, px, sz=qty, reduce_only=True)
+        if ord_id:
+            self._tp_order_id = ord_id
+            self._tp_order_px = px
+
+    def _cancel_tp(self):
+        if self._tp_order_id:
+            self._cancel_order_id(self._tp_order_id)
+            self._tp_order_id = None
+            self._tp_order_px = 0.0
+
+    # ── 移动止损挂单 ─────────────────────────────────────────────────
+    def _place_sl(self, side: str, trigger: float, order_px: float, qty: float):
+        close_side = "sell" if side == "long" else "buy"
+        algo_id = self._place_stop_algo(close_side, trigger, order_px, qty)
+        if algo_id:
+            self._sl_algo_id = algo_id
+            self._sl_stop_px = trigger
+
+    def _cancel_sl(self):
+        if self._sl_algo_id:
+            self._cancel_algo_id(self._sl_algo_id)
+            self._sl_algo_id = None
+            self._sl_stop_px = 0.0
+
+    # ── 管理出场挂单 (止盈预挂 + 移动止损预挂) ─────────────────────
+    def _manage_exit_orders(self, pos: Dict[str, Any], price: float):
+        side = pos["side"]
+        qty = pos["qty"]
+        closes = self._closes
+        replace_pct = self.cfg.get("replace_pct", 0.001)
+        guard_pct = self.cfg.get("sl_guard_pct", 0.001)
+
+        # ── 1) RSI 止盈预挂 ──────────────────────────────────────
+        tp_px: Optional[float] = None
+        if self.strategy.tp_armed:
+            tp_px = self.strategy.predict_exit_price(closes)
+
+        if tp_px is not None:
+            # 保证 post-only 挂在对己方有利一侧 (多头卖单 ≥ 当前价, 空头买单 ≤ 当前价)
+            if side == "long":
+                tp_px = max(tp_px, price)
+            else:
+                tp_px = min(tp_px, price)
+            tp_px = self._round_tick(tp_px)
+
+            if self._tp_order_id is None:
+                self._place_tp(side, tp_px, qty)
+            elif self._tp_order_px and \
+                    abs(tp_px - self._tp_order_px) / self._tp_order_px >= replace_pct:
+                log.info(f"止盈预测价漂移 {abs(tp_px - self._tp_order_px) / self._tp_order_px:.4%}, 撤单重挂")
+                self._cancel_tp()
+                self._place_tp(side, tp_px, qty)
+        else:
+            self._cancel_tp()
+
+        # ── 2) 移动止损预挂 ──────────────────────────────────────
+        sl_armed, sl_stop_px = self.strategy.stop_info(price)
+        if sl_armed and sl_stop_px > 0:
+            sl_stop_px = self._round_tick(sl_stop_px)
+            order_px = sl_stop_px * (1 - guard_pct) if side == "long" \
+                else sl_stop_px * (1 + guard_pct)
+            order_px = self._round_tick(order_px)
+
+            if self._sl_algo_id is None:
+                self._place_sl(side, sl_stop_px, order_px, qty)
+            elif self._sl_stop_px and \
+                    abs(sl_stop_px - self._sl_stop_px) / self._sl_stop_px >= replace_pct:
+                log.info(f"止损线漂移 {abs(sl_stop_px - self._sl_stop_px) / self._sl_stop_px:.4%}, 撤单重挂")
+                self._cancel_sl()
+                self._place_sl(side, sl_stop_px, order_px, qty)
+        else:
+            self._cancel_sl()
+
     # ── 主循环的一步 ─────────────────────────────────────────────────
     async def _tick(self):
-        """每个轮询周期执行一次"""
-        # 1. 刷新 K 线 & RSI
         await self._fetch_and_update_closes()
         if len(self._closes) < self.cfg["rsi_period"] + 1:
             log.warning("K 线数据不足, 跳过本周期")
             return
 
-        # 2. 获取当前价格
         price = self._get_current_price()
         if price is None:
             return
 
-        # 3. 同步持仓状态
         pos = self._get_position()
-        log.info(f"持仓状态: {pos}")
-        # ── 情况 A: 有挂单待成交 ──────────────────────────────────
-        if self._pending_order_id:
-            if self._check_order_filled(self._pending_order_id):
-                log.info(f"订单成交: {self._pending_order_id}")
-                self._pending_order_id = None
-                # 检查新持仓
+        log.info(f"持仓状态: {pos} | 最新价: {price}")
+
+        # ── 情况 A: 有入场挂单待成交 ──────────────────────────────
+        if self._entry_order_id:
+            if self._check_order_filled(self._entry_order_id):
+                log.info(f"入场单成交: {self._entry_order_id}")
+                self._entry_order_id = None
+                self._entry_side = None
+                self._entry_retry = 0
                 pos = self._get_position()
                 if pos:
                     self.strategy.in_position  = pos["side"]
@@ -516,58 +609,49 @@ class OKXTradingBot:
                     self.strategy.peak_price   = pos["avg_px"]
                     self.strategy.trough_price = pos["avg_px"]
                     log.info(f"开仓成功: {pos['side']} @ {pos['avg_px']:.2f}")
-                self._retry_count = 0
-                self._pending_side = None
             else:
-                # 挂单超时处理
-                elapsed = self._retry_count * self.cfg["poll_interval"]
+                elapsed = self._entry_retry * self.cfg["poll_interval"]
                 if elapsed >= self.cfg["order_timeout"]:
-                    if self._retry_count >= self.cfg["max_retry"]:
-                        log.warning(f"挂单重试 {self._retry_count} 次仍未成交, 放弃信号")
-                        if not self._cancel_all_orders():
-                            log.warning("撤单未完全成功, 但已放弃信号 — 请手动检查挂单")
-                        self._retry_count = 0
+                    if self._entry_retry >= self.cfg["max_retry"]:
+                        log.warning(f"入场挂单重试 {self._entry_retry} 次仍未成交, 放弃信号")
+                        self._cancel_order_id(self._entry_order_id)
+                        self._entry_order_id = None
+                        self._entry_side = None
+                        self._entry_retry = 0
                     else:
-                        log.info(f"挂单超时 ({elapsed}s), 撤单重挂 ({self._retry_count+1}/{self.cfg['max_retry']})")
-                        if self._cancel_all_orders():
-                            side = self._pending_side
-                            self._pending_side = None
+                        log.info(f"入场挂单超时 ({elapsed}s), 撤单重挂 "
+                                 f"({self._entry_retry+1}/{self.cfg['max_retry']})")
+                        side = self._entry_side
+                        self._cancel_order_id(self._entry_order_id)
+                        self._entry_order_id = None
+                        if side:
                             self._place_entry(side)
-                            self._retry_count += 1
-                        else:
-                            log.warning("撤单未完全成功, 跳过重挂以避免重复下单")
+                            self._entry_retry += 1
                 else:
-                    self._retry_count += 1
-            return  # 有挂单时不处理新信号
+                    self._entry_retry += 1
+            return
 
-        # ── 情况 B: 有持仓 ─────────────────────────────────────────
+        # ── 情况 B: 有持仓 → 管理出场挂单 ────────────────────────
         if pos:
             side = pos["side"]
             self.strategy.in_position = side
-
-            # 更新峰值/谷值
             self.strategy.update_peak_trough(price)
-
-            # 检查出场条件
-            if self.strategy.exit_signal(price):
-                rsi_val = self.strategy.rsi
-                log.info(f"出场信号触发: {side} | RSI={rsi_val:.1f} | price={price:.2f} | "
-                         f"peak={self.strategy.peak_price:.2f} trough={self.strategy.trough_price:.2f}")
-                if not self._cancel_all_orders():
-                    log.warning("撤单未完全成功, 跳过平仓下单以避免重复委托")
-                else:
-                    self._close_position(side)
-                    self.strategy.clear_position()
+            self._manage_exit_orders(pos, price)
             return
+
+        # ── 持仓刚被平掉 (TP / SL / 外部) → 清理残留挂单 ────────
+        if self.strategy.in_position is not None:
+            log.info("检测到持仓已平, 清理残留出场挂单")
+            self._cancel_tp()
+            self._cancel_sl()
+            self.strategy.clear_position()
 
         # ── 情况 C: 空仓, 检查入场信号 ────────────────────────────
         signal = self.strategy.entry_signal()
         if signal:
-            log.info(f"入场信号: {signal.upper()} | RSI={self.strategy.rsi:.1f} | price={price:.2f}")
-            if not self._cancel_all_orders():
-                log.warning("撤单未完全成功, 跳过入场以避免重复委托")
-            else:
-                self._place_entry(signal)
+            log.info(f"入场信号: {signal.upper()} | RSI={self.strategy.rsi:.1f} | "
+                     f"price={price:.2f}")
+            self._place_entry(signal)
 
     # ── 主循环 ──────────────────────────────────────────────────────
     async def run(self):
@@ -575,11 +659,19 @@ class OKXTradingBot:
 
         log.info("=" * 60)
         log.info(f"策略启动: RSI({self.cfg['rsi_period']}) 均值回归")
-        log.info(f"品种: {self.symbol}  |  K线: 15m  |  模式: {'模拟盘' if self.demo else '★实盘★'}")
+        log.info(f"品种: {self.symbol}  |  K线: 15m  |  模式: "
+                 f"{'模拟盘' if self.demo else '★实盘★'}")
         log.info(f"每单: {self.order_sz} 张  |  最大持仓: {self.max_pos} 张")
-        log.info(f"做多: RSI<{self.cfg['entry_long']} → 平仓 RSI>{self.cfg['exit_long']} 或 -{self.cfg['trailing_pct']*100:.0f}%")
-        log.info(f"做空: RSI>{self.cfg['entry_short']} → 平仓 RSI<{self.cfg['exit_short']} 或 +{self.cfg['trailing_pct']*100:.0f}%")
-        log.info(f"费率: 做市商 0.02% (post-only)")
+        log.info(f"多头入场: RSI 上穿 {self.cfg['entry_long']} | "
+                 f"止盈预挂 RSI≥{self.cfg['exit_long']-self.cfg.get('tp_arm_margin', 5)} "
+                 f"(目标 RSI={self.cfg['exit_long']})")
+        log.info(f"空头入场: RSI 下穿 {self.cfg['entry_short']} | "
+                 f"止盈预挂 RSI≤{self.cfg['exit_short']+self.cfg.get('tp_arm_margin', 5)} "
+                 f"(目标 RSI={self.cfg['exit_short']})")
+        log.info(f"移动止损: 涨跌幅 {self.cfg['trailing_pct']*100:.2f}% | "
+                 f"预挂启动 {self.cfg.get('sl_arm_ratio', 0.5)*self.cfg['trailing_pct']*100:.2f}%")
+        log.info(f"重挂漂移阈值: {self.cfg.get('replace_pct', 0.001)*100:.1f}%")
+        log.info(f"费率: 全流程仅挂单 (入场 post-only)")
         log.info("=" * 60)
 
         self._running = True
@@ -593,15 +685,16 @@ class OKXTradingBot:
     def stop(self):
         log.info("收到停止信号, 正在退出...")
         self._running = False
-        # 不强制平仓 — 用户可以手动管理剩余仓位
-        self._cancel_all_orders()
+        if self._entry_order_id:
+            self._cancel_order_id(self._entry_order_id)
+        self._cancel_tp()
+        self._cancel_sl()
 
 
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║                           入口                                      ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 
-# ── 日志 ──────────────────────────────────────────────────────────────
 log = logging.getLogger("rsi_bot")
 log.setLevel(logging.INFO)
 _handler = logging.StreamHandler(sys.stdout)
@@ -613,7 +706,6 @@ log.addHandler(_handler)
 
 
 def validate_config(cfg: dict):
-    """启动前校验配置"""
     errors = []
     if not cfg["api_key"]:
         errors.append("api_key 为空 — 请在 config.json 中填写 OKX API Key")
@@ -631,15 +723,9 @@ def validate_config(cfg: dict):
 
 
 def restart_program():
-    """
-    重新运行程序主体。
-    跨平台实现: 启动一个新进程运行本脚本, 随后立即退出当前进程。
-    Windows 下使用 CREATE_NEW_PROCESS_GROUP 避免 Ctrl+C 信号影响新进程。
-    """
     log.info("正在重新启动程序...")
     try:
         cmd = [sys.executable, os.path.abspath(__file__)]
-        # 透传命令行参数 (除去脚本本身)
         cmd.extend(sys.argv[1:])
         if os.name == "nt":
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -649,7 +735,6 @@ def restart_program():
     except Exception as e:
         log.error(f"重新启动程序失败: {e}")
         return
-    # 立即退出当前进程, 由新进程接手
     os._exit(0)
 
 
@@ -660,13 +745,11 @@ async def main():
 
     bot = OKXTradingBot(CONFIG)
 
-    # 信号处理: Ctrl+C 优雅退出
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, bot.stop)
         except NotImplementedError:
-            # Windows 不支持 add_signal_handler
             pass
 
     try:
