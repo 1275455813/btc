@@ -27,6 +27,8 @@ import os
 import signal
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
 # ── OKX SDK ──────────────────────────────────────────────────────────
@@ -38,6 +40,15 @@ try:
 except ImportError:
     print("请先安装 python-okx: pip install python-okx")
     sys.exit(1)
+
+# ── 趋势过滤 (pandas/numpy) ─────────────────────────────────────────
+try:
+    import pandas as pd
+    import numpy as np  # noqa: F401  trend_filter 依赖 numpy
+    from trend_filter import live_signal
+except ImportError:
+    pd = None
+    live_signal = None
 
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║                    ★ 配置区 — 参数全部放在 config.json ★            ║
@@ -56,6 +67,10 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 #   sl_arm_ratio                     : 移动止损预挂启动比例 (占 trailing_pct 的比例), 如 0.5
 #   replace_pct                      : 预测挂单价漂移超过该比例时撤单重挂 (如 0.001 = 0.1%)
 #   sl_guard_pct                     : 止损条件单触发后的限价偏移 (确保成交), 如 0.001 = 0.1%
+#   trend_enabled                    : True=启用趋势过滤, False=关闭
+#   trend_bar / trend_ema_period     : 大周期K线级别与 EMA 周期
+#   trend_require_slope / trend_band_pct : 是否要求 EMA 斜率同向 / 缓冲带比例
+#   trend_candle_limit               : 趋势过滤拉取的大周期K线数量
 #   limit_offset_bps / order_timeout / max_retry : 挂单参数
 #   poll_interval / candle_limit / max_fetch_errors : 运行参数
 
@@ -290,6 +305,16 @@ class OKXTradingBot:
 
         self.strategy = RSIStrategy(cfg)
 
+        # 趋势过滤状态 (0=不可开仓, 1=可开多, 2=可开空)
+        self._trend_enabled = bool(cfg.get("trend_enabled", True))
+        self._trend_available = (self._trend_enabled and pd is not None
+                                 and live_signal is not None)
+        if not self._trend_available:
+            log.warning("趋势过滤不可用 (未启用或缺少 pandas/numpy/trend_filter.py), 将跳过趋势过滤")
+        self._trend_signal: int = 0
+        self._trend_info: Optional[Dict[str, Any]] = None
+        self._next_fetch_at: float = 0.0
+
         # 入场挂单追踪
         self._entry_order_id: Optional[str] = None
         self._entry_side:     Optional[str] = None
@@ -333,6 +358,7 @@ class OKXTradingBot:
                 log.info(f"合约: {self.symbol}  |  tick: {self._tick_size}  |  "
                          f"ctVal: {inst.get('ctVal', '?')}")
                 await self._fetch_and_update_closes()
+                self._update_trend_filter()
                 return
             except Exception as e:
                 log.error(f"初始化异常: {e}  |  30 秒后重试初始化...")
@@ -352,7 +378,6 @@ class OKXTradingBot:
             if self._fetch_error_count:
                 log.info(f"K线获取恢复正常, 连续异常计数清零 (此前 {self._fetch_error_count} 次)")
             self._fetch_error_count = 0
-            log.info(f"K 线更新完成, {len(closes)} 根 | 最新 RSI={self.strategy.rsi:.1f}")
         except Exception as e:
             self._fetch_error_count += 1
             log.error(f"获取K线异常: {e}  (连续第 {self._fetch_error_count} 次)")
@@ -474,6 +499,84 @@ class OKXTradingBot:
             log.error(f"撤条件单异常 algoId={algo_id}: {e}")
             return False
 
+    # ── 趋势过滤 ─────────────────────────────────────────────────────
+    def _next_bar_close_ts(self, bar: str) -> float:
+        """返回下一次大周期K线收盘时间 (unix 秒)。
+        OKX K线按 UTC epoch 对齐切分, 1h/4h/1D 均正确对齐。"""
+        minutes = {"1m": 1, "5m": 5, "15m": 15, "30m": 30,
+                   "1H": 60, "2H": 120, "4H": 240, "6H": 360, "12H": 720,
+                   "1D": 1440, "1W": 10080}.get(bar, 240)
+        step = minutes * 60
+        now = int(time.time())
+        return ((now // step) + 1) * step
+
+    def _update_trend_filter(self):
+        """在大周期K线收盘后拉取趋势过滤信号, 得到当前可开仓方向
+           0=不可开仓, 1=可开多, 2=可开空。结果缓存在 self._trend_signal。
+
+        拉取策略:
+          - 首次(尚未成功拉取过)立即拉取;
+          - 成功拉取后记录下一次大周期K线收盘时间, 到达前不重复拉取;
+          - 到达收盘时间后立即拉取; 若拉取失败则不更新下次时间,
+            于是每个轮询周期都会重试, 直到成功 (与 15m K线一致)。
+        """
+        if not self._trend_available:
+            return
+
+        now = time.time()
+        # 首次必须拉取; 之后只在到达下一次收盘时间时才拉取
+        if self._trend_info is not None and now < self._next_fetch_at:
+            return
+
+        try:
+            bar = str(self.cfg.get("trend_bar", "4H"))
+            limit = str(self.cfg.get("trend_candle_limit", 200))
+            resp = self._market_api.get_candlesticks(
+                instId=self.symbol, bar=bar, limit=limit)
+            if resp.get("code") != "0":
+                log.warning(f"获取趋势K线失败: {resp}")
+                return
+
+            candles = resp["data"]  # 最新在前
+            rows = []
+            for c in reversed(candles):  # 转成时间升序
+                rows.append({
+                    "ts": int(float(c[0])),  # unix 毫秒
+                    "close": float(c[4]),
+                })
+            df = pd.DataFrame(rows)
+            df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+
+            info = live_signal(
+                df,
+                bar=bar,
+                ema_period=self.cfg.get("trend_ema_period", 50),
+                require_slope=bool(self.cfg.get("trend_require_slope", False)),
+                band_pct=float(self.cfg.get("trend_band_pct", 0.0)),
+                return_details=True)
+            self._trend_signal = int(info["signal"])
+            self._trend_info = info
+            # 成功: 安排下一次大周期K线收盘时再次拉取
+            self._next_fetch_at = self._next_bar_close_ts(bar)
+            nxt = datetime.fromtimestamp(self._next_fetch_at, tz=timezone.utc)
+            log.info(f"趋势过滤: {info['reason']} | 收盘={info['close']} | "
+                     f"EMA={info.get('ema')} | bar={bar} | "
+                     f"下次拉取={nxt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        except Exception as e:
+            # 失败: 不更新 _next_fetch_at, 下个轮询继续重试
+            log.error(f"趋势过滤异常: {e}")
+
+    def _entry_allowed(self, direction: str) -> bool:
+        """趋势过滤网关: 开多须趋势=1, 开空须趋势=2。
+           趋势模块不可用时放行(保持原策略行为)。"""
+        if not self._trend_available:
+            return True
+        if direction == "long":
+            return self._trend_signal == 1
+        if direction == "short":
+            return self._trend_signal == 2
+        return False
+
     def _check_order_filled(self, ord_id: str) -> bool:
         try:
             resp = self._trade_api.get_order(instId=self.symbol, ordId=ord_id)
@@ -581,6 +684,32 @@ class OKXTradingBot:
         else:
             self._cancel_sl()
 
+    # ── 统一状态日志 ────────────────────────────────────────────────
+    def _log_status(self, price: float, pos: Optional[Dict[str, Any]]):
+        """每个轮询周期统一输出一条运行状态摘要。"""
+        rsi = self.strategy.rsi
+        rsi_s = f"{rsi:.1f}" if rsi is not None else "-"
+
+        pos_s = "-"
+        if pos:
+            pos_s = (f"{pos['side'].upper()} {pos['qty']}张 "
+                     f"均价@{pos['avg_px']} 浮盈={pos['upl']}")
+
+        trend_s = "-"
+        if self._trend_available:
+            trend_s = {0: "不可开", 1: "可开多", 2: "可开空"}.get(
+                self._trend_signal, str(self._trend_signal))
+
+        entry_s = "有" if self._entry_order_id else "无"
+        tp_s = f"有@{self._tp_order_px}" if self._tp_order_id else "无"
+        sl_s = f"有@{self._sl_stop_px}" if self._sl_algo_id else "无"
+
+        log.info(
+            f"[状态] 价={price:.2f} RSI={rsi_s} 持仓={pos_s} 趋势={trend_s} "
+            f"入场挂单={entry_s} 止盈挂单={tp_s} 止损挂单={sl_s} "
+            f"峰值={self.strategy.peak_price:.2f} 谷值={self.strategy.trough_price:.2f}"
+        )
+
     # ── 主循环的一步 ─────────────────────────────────────────────────
     async def _tick(self):
         await self._fetch_and_update_closes()
@@ -593,7 +722,6 @@ class OKXTradingBot:
             return
 
         pos = self._get_position()
-        log.info(f"持仓状态: {pos} | 最新价: {price}")
 
         # ── 情况 A: 有入场挂单待成交 ──────────────────────────────
         if self._entry_order_id:
@@ -629,6 +757,7 @@ class OKXTradingBot:
                             self._entry_retry += 1
                 else:
                     self._entry_retry += 1
+            self._log_status(price, pos)
             return
 
         # ── 情况 B: 有持仓 → 管理出场挂单 ────────────────────────
@@ -637,6 +766,7 @@ class OKXTradingBot:
             self.strategy.in_position = side
             self.strategy.update_peak_trough(price)
             self._manage_exit_orders(pos, price)
+            self._log_status(price, pos)
             return
 
         # ── 持仓刚被平掉 (TP / SL / 外部) → 清理残留挂单 ────────
@@ -647,11 +777,18 @@ class OKXTradingBot:
             self.strategy.clear_position()
 
         # ── 情况 C: 空仓, 检查入场信号 ────────────────────────────
+        self._update_trend_filter()
         signal = self.strategy.entry_signal()
         if signal:
-            log.info(f"入场信号: {signal.upper()} | RSI={self.strategy.rsi:.1f} | "
-                     f"price={price:.2f}")
-            self._place_entry(signal)
+            if not self._entry_allowed(signal):
+                log.info(f"入场信号 {signal.upper()} 被趋势过滤拦截 "
+                         f"(趋势={self._trend_signal})")
+            else:
+                log.info(f"入场信号: {signal.upper()} | RSI={self.strategy.rsi:.1f} | "
+                         f"price={price:.2f} | 趋势={self._trend_signal}")
+                self._place_entry(signal)
+
+        self._log_status(price, pos)
 
     # ── 主循环 ──────────────────────────────────────────────────────
     async def run(self):
@@ -671,6 +808,12 @@ class OKXTradingBot:
         log.info(f"移动止损: 涨跌幅 {self.cfg['trailing_pct']*100:.2f}% | "
                  f"预挂启动 {self.cfg.get('sl_arm_ratio', 0.5)*self.cfg['trailing_pct']*100:.2f}%")
         log.info(f"重挂漂移阈值: {self.cfg.get('replace_pct', 0.001)*100:.1f}%")
+        if self._trend_available:
+            log.info(f"趋势过滤: {self.cfg.get('trend_bar', '4H')} "
+                     f"EMA{self.cfg.get('trend_ema_period', 50)} "
+                     f"(0=不可开 1=开多 2=开空)")
+        else:
+            log.info("趋势过滤: 关闭")
         log.info(f"费率: 全流程仅挂单 (入场 post-only)")
         log.info("=" * 60)
 
