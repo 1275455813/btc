@@ -112,6 +112,7 @@ class RSIStrategy:
 
         self.tp_arm_margin = float(cfg.get("tp_arm_margin", 5))
         self.sl_arm_ratio  = float(cfg.get("sl_arm_ratio", 0.5))
+        self.entry_arm_margin = float(cfg.get("entry_arm_margin", 5))
 
         self._rsi_history: List[float] = []       # 最近两条 RSI 用于检测交叉
         self._current_rsi: Optional[float] = None
@@ -177,6 +178,58 @@ class RSIStrategy:
         if prev_rsi >= self.short_in and curr_rsi < self.short_in:
             return "short"
         return None
+
+    # ── 入场预挂: 返回当前应预挂的入场方向 ────────────────────────
+    def entry_arm_direction(self) -> Optional[str]:
+        """RSI 进入入场预警区间时返回方向:
+           做多: RSI ∈ [entry_long - entry_arm_margin, entry_long)
+           做空: RSI ∈ (entry_short, entry_short + entry_arm_margin]
+           否则返回 None。"""
+        if self.in_position is not None or self._current_rsi is None:
+            return None
+        rsi = self._current_rsi
+        if self.long_in - self.entry_arm_margin <= rsi < self.long_in:
+            return "long"
+        if self.short_in < rsi <= self.short_in + self.entry_arm_margin:
+            return "short"
+        return None
+
+    # ── 入场预挂: 二分反解"使 RSI 到达入场阈值"的价格 ────────────
+    def predict_entry_price(self, closes: List[float]) -> Optional[float]:
+        """返回"下一根收盘价 p 使 RSI 恰等于入场阈值"的价格。
+        做多返回 RSI=entry_long 对应价 (在上方); 做空返回 RSI=entry_short 对应价 (在下方)。"""
+        direction = self.entry_arm_direction()
+        if direction is None or len(closes) < self.period + 1:
+            return None
+
+        target = self.long_in if direction == "long" else self.short_in
+        cur = self._wilders_rsi(closes)
+        ref = closes[-1]
+
+        if direction == "long":
+            if cur >= target:
+                return ref
+            lo, hi = ref, ref * 1.20
+        else:
+            if cur <= target:
+                return ref
+            lo, hi = ref * 0.80, ref
+
+        for _ in range(10):
+            if self._rsi_at_price(closes, lo) <= target <= self._rsi_at_price(closes, hi):
+                break
+            if direction == "long":
+                hi *= 1.3
+            else:
+                lo *= 0.7
+
+        for _ in range(120):
+            mid = (lo + hi) / 2.0
+            if self._rsi_at_price(closes, mid) < target:
+                lo = mid
+            else:
+                hi = mid
+        return (lo + hi) / 2.0
 
     # ── 止盈预挂: 是否已进入预挂区间 ──────────────────────────────
     @property
@@ -319,6 +372,10 @@ class OKXTradingBot:
         self._entry_order_id: Optional[str] = None
         self._entry_side:     Optional[str] = None
         self._entry_retry:    int = 0
+
+        # 入场条件单追踪 (OKX algo order, 触发后市价成交)
+        self._entry_algo_id: Optional[str] = None
+        self._entry_arm_px:  float = 0.0
 
         # 止盈挂单追踪 (普通 post-only 限价单)
         self._tp_order_id: Optional[str] = None
@@ -607,6 +664,75 @@ class OKXTradingBot:
             self._entry_side = direction
             self._entry_retry = 0
 
+    # ── 入场条件单 (预测价触发后市价成交) ─────────────────────────
+    def _place_entry_algo(self, direction: str, trigger_px: float) -> Optional[str]:
+        """做多/做空入场条件单: 价格触及 trigger_px 时市价成交。
+        OKX 条件单 orderPx=-1 表示触发后按市价委托。"""
+        side = "buy" if direction == "long" else "sell"
+        try:
+            resp = self._trade_api.place_algo_order(
+                instId=self.symbol,
+                tdMode="cross",
+                side=side,
+                ordType="conditional",
+                sz=self.order_sz,
+                triggerPx=str(trigger_px),
+                orderPx="-1")
+            if resp.get("code") == "0":
+                algo_id = resp["data"][0]["algoId"]
+                log.info(f"挂入场条件单: {side.upper()} {self.order_sz}张 "
+                         f"触发@{trigger_px} (市价成交) algoId={algo_id}")
+                return algo_id
+            log.error(f"挂入场条件单失败: {resp}")
+            return None
+        except Exception as e:
+            log.error(f"挂入场条件单异常: {e}")
+            return None
+
+    def _cancel_entry_algo(self):
+        if self._entry_algo_id:
+            self._cancel_algo_id(self._entry_algo_id)
+            self._entry_algo_id = None
+            self._entry_arm_px = 0.0
+
+    # ── 管理入场预挂 (空仓: RSI 预警区间预测价挂条件单) ──────────
+    def _manage_entry_algo(self, price: float):
+        """空仓时, 若 RSI 进入入场预警区间(如做多 25~30), 预测到达阈值
+        的价格并挂入场条件单; 预测价漂移 ≥ replace_pct 撤单重挂; 离开
+        预警区间则撤单。"""
+        direction = self.strategy.entry_arm_direction()
+
+        if direction is None:
+            self._cancel_entry_algo()
+            return
+
+        # 趋势过滤也作用于预挂开仓方向
+        if not self._entry_allowed(direction):
+            self._cancel_entry_algo()
+            return
+
+        entry_px = self.strategy.predict_entry_price(self._closes)
+        if entry_px is None:
+            self._cancel_entry_algo()
+            return
+
+        replace_pct = self.cfg.get("replace_pct", 0.001)
+        entry_px = self._round_tick(entry_px)
+
+        if self._entry_algo_id is None:
+            algo_id = self._place_entry_algo(direction, entry_px)
+            if algo_id:
+                self._entry_algo_id = algo_id
+                self._entry_arm_px = entry_px
+        elif self._entry_arm_px and \
+                abs(entry_px - self._entry_arm_px) / self._entry_arm_px >= replace_pct:
+            log.info(f"入场预测价漂移 {abs(entry_px - self._entry_arm_px) / self._entry_arm_px:.4%}, 撤单重挂")
+            self._cancel_entry_algo()
+            algo_id = self._place_entry_algo(direction, entry_px)
+            if algo_id:
+                self._entry_algo_id = algo_id
+                self._entry_arm_px = entry_px
+
     # ── 止盈挂单 ─────────────────────────────────────────────────────
     def _place_tp(self, side: str, px: float, qty: float):
         close_side = "sell" if side == "long" else "buy"
@@ -701,12 +827,14 @@ class OKXTradingBot:
                 self._trend_signal, str(self._trend_signal))
 
         entry_s = "有" if self._entry_order_id else "无"
+        entry_algo_s = f"有@{self._entry_arm_px}" if self._entry_algo_id else "无"
         tp_s = f"有@{self._tp_order_px}" if self._tp_order_id else "无"
         sl_s = f"有@{self._sl_stop_px}" if self._sl_algo_id else "无"
 
         log.info(
             f"[状态] 价={price:.2f} RSI={rsi_s} 持仓={pos_s} 趋势={trend_s} "
-            f"入场挂单={entry_s} 止盈挂单={tp_s} 止损挂单={sl_s} "
+            f"入场挂单={entry_s} 入场条件单={entry_algo_s} "
+            f"止盈挂单={tp_s} 止损挂单={sl_s} "
             f"峰值={self.strategy.peak_price:.2f} 谷值={self.strategy.trough_price:.2f}"
         )
 
@@ -737,6 +865,7 @@ class OKXTradingBot:
                     self.strategy.peak_price   = pos["avg_px"]
                     self.strategy.trough_price = pos["avg_px"]
                     log.info(f"开仓成功: {pos['side']} @ {pos['avg_px']:.2f}")
+                self._cancel_entry_algo()
             else:
                 elapsed = self._entry_retry * self.cfg["poll_interval"]
                 if elapsed >= self.cfg["order_timeout"]:
@@ -764,6 +893,7 @@ class OKXTradingBot:
         if pos:
             side = pos["side"]
             self.strategy.in_position = side
+            self._cancel_entry_algo()
             self.strategy.update_peak_trough(price)
             self._manage_exit_orders(pos, price)
             self._log_status(price, pos)
@@ -776,10 +906,13 @@ class OKXTradingBot:
             self._cancel_sl()
             self.strategy.clear_position()
 
-        # ── 情况 C: 空仓, 检查入场信号 ────────────────────────────
+        # ── 情况 C: 空仓 → 趋势过滤 + 入场预挂/信号 ──────────────
         self._update_trend_filter()
+        self._manage_entry_algo(price)
+
+        # RSI 已越过入场阈值时, 原有的普通 post-only 入场信号仍作为兜底
         signal = self.strategy.entry_signal()
-        if signal:
+        if signal and self._entry_algo_id is None:
             if not self._entry_allowed(signal):
                 log.info(f"入场信号 {signal.upper()} 被趋势过滤拦截 "
                          f"(趋势={self._trend_signal})")
@@ -832,6 +965,7 @@ class OKXTradingBot:
             self._cancel_order_id(self._entry_order_id)
         self._cancel_tp()
         self._cancel_sl()
+        self._cancel_entry_algo()
 
 
 # ╔══════════════════════════════════════════════════════════════════════╗
