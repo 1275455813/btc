@@ -151,8 +151,14 @@ class RSIStrategy:
         return 100.0 - (100.0 / (1.0 + rs))
 
     def _rsi_at_price(self, closes: List[float], p: float) -> float:
-        """假设下一收盘价为 p 时的 RSI 值"""
-        return self._wilders_rsi(list(closes) + [float(p)])
+        """假设当前(未收盘)K线的收盘价变为 p 时的 RSI 值。
+        实盘中 closes 最后一根是正在形成的 K 线, 其 close 随实时价变动,
+        因此预测时替换最后一根, 而非追加一根新 K 线。"""
+        arr = list(closes)
+        if arr:
+            arr[-1] = float(p)
+            return self._wilders_rsi(arr)
+        return self._wilders_rsi([float(p)])
 
     # ── 更新 K 线 ──────────────────────────────────────────────────
     def update(self, closes: List[float]):
@@ -513,7 +519,7 @@ class OKXTradingBot:
                 instId=self.symbol,
                 tdMode="cross",
                 side=side,
-                ordType="conditional",
+                ordType="trigger",
                 sz=str(qty),
                 reduceOnly="true",
                 triggerPx=str(trigger_px),
@@ -674,7 +680,7 @@ class OKXTradingBot:
                 instId=self.symbol,
                 tdMode="cross",
                 side=side,
-                ordType="conditional",
+                ordType="trigger",
                 sz=self.order_sz,
                 triggerPx=str(trigger_px),
                 orderPx="-1")
