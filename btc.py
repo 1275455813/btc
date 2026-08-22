@@ -824,8 +824,11 @@ class OKXTradingBot:
 
         pos_s = "-"
         if pos:
-            pos_s = (f"{pos['side'].upper()} {pos['qty']}张 "
-                     f"均价@{pos['avg_px']} 浮盈={pos['upl']}")
+            qty_s = f"{pos['qty']:.2f}"
+            avg_s = f"{pos['avg_px']:.2f}"
+            upl_s = f"{pos['upl']:.2f}"
+            pos_s = (f"{pos['side'].upper()} {qty_s}张 "
+                     f"均价@{avg_s} 浮盈={upl_s}")
 
         trend_s = "-"
         if self._trend_available:
